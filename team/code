@@ -1,0 +1,619 @@
+// shopping_cart.cpp
+// C++98-compatible console shopping cart system
+// Works with older Dev-C++ compilers (no C++11/C++17 features)
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <ctime>
+#include <limits>
+
+using namespace std;
+
+// -----------------------------
+// Utility conversions & helpers
+// -----------------------------
+string trim(const string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+vector<string> split_simple(const string &s, char delim) {
+    vector<string> out;
+    string cur;
+    stringstream ss(s);
+    while (getline(ss, cur, delim)) out.push_back(cur);
+    return out;
+}
+
+string int_to_string(int v) {
+    stringstream ss; ss << v; return ss.str();
+}
+
+string double_to_string(double v) {
+    stringstream ss; ss << v; return ss.str();
+}
+
+int to_int(const string &s) {
+    stringstream ss(s);
+    int v = 0;
+    ss >> v;
+    return v;
+}
+
+double to_double(const string &s) {
+    stringstream ss(s);
+    double v = 0.0;
+    ss >> v;
+    return v;
+}
+
+// CSV escaping (simple)
+string escape_csv(const string &s) {
+    bool need = (s.find(',') != string::npos) || (s.find('"') != string::npos);
+    if (!need) return s;
+    string out = "\"";
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '"') out += "\"\"";
+        else out += s[i];
+    }
+    out += "\"";
+    return out;
+}
+
+string unescape_csv(const string &s) {
+    string t = trim(s);
+    if (t.size() >= 2 && t[0] == '"' && t[t.size()-1] == '"') {
+        string inner = t.substr(1, t.size()-2);
+        string res;
+        for (size_t i = 0; i < inner.size(); ++i) {
+            if (inner[i] == '"' && i+1 < inner.size() && inner[i+1] == '"') {
+                res += '"';
+                ++i;
+            } else {
+                res += inner[i];
+            }
+        }
+        return res;
+    }
+    return t;
+}
+
+// CSV line parser respecting quotes (simple)
+vector<string> parse_csv_line(const string &line) {
+    vector<string> fields;
+    string cur;
+    bool inquote = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+        if (c == '"') {
+            if (inquote && i+1 < line.size() && line[i+1] == '"') {
+                cur += '"';
+                ++i;
+            } else {
+                inquote = !inquote;
+            }
+        } else if (c == ',' && !inquote) {
+            fields.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    fields.push_back(cur);
+    return fields;
+}
+
+// -----------------------------
+// Models
+// -----------------------------
+struct Product {
+    int id;
+    string name;
+    string description;
+    double price;
+    int stock;
+    Product() : id(0), price(0.0), stock(0) {}
+    Product(int i, const string &n, const string &d, double p, int s)
+        : id(i), name(n), description(d), price(p), stock(s) {}
+};
+
+struct CartItem {
+    int productId;
+    string name;
+    double unitPrice;
+    int qty;
+    CartItem() : productId(0), unitPrice(0.0), qty(0) {}
+    CartItem(int pid, const string &n, double up, int q)
+        : productId(pid), name(n), unitPrice(up), qty(q) {}
+};
+
+// -----------------------------
+// Inventory (map) and persistence
+// -----------------------------
+class Inventory {
+private:
+    map<int, Product> products;
+    int nextId;
+    string filename;
+
+public:
+    Inventory(const string &file = "products.csv") : nextId(1), filename(file) {
+        load();
+    }
+
+    void load() {
+        products.clear();
+        nextId = 1;
+        ifstream in(filename.c_str());
+        if (!in) {
+            create_sample(); // create defaults and return
+            return;
+        }
+        string line;
+        while (getline(in, line)) {
+            if (trim(line).empty()) continue;
+            vector<string> f = parse_csv_line(line);
+            if (f.size() < 5) continue;
+            int id = to_int(unescape_csv(f[0]));
+            string name = unescape_csv(f[1]);
+            string desc = unescape_csv(f[2]);
+            double price = to_double(unescape_csv(f[3]));
+            int stock = to_int(unescape_csv(f[4]));
+            products[id] = Product(id, name, desc, price, stock);
+            if (id >= nextId) nextId = id + 1;
+        }
+        in.close();
+    }
+
+    void save() const {
+        ofstream out(filename.c_str());
+        if (!out) {
+            cerr << "Cannot write to " << filename << endl;
+            return;
+        }
+        // iterate sorted by id because map is ordered
+        for (map<int, Product>::const_iterator it = products.begin(); it != products.end(); ++it) {
+            const Product &p = it->second;
+            out << escape_csv(int_to_string(p.id)) << ","
+                << escape_csv(p.name) << ","
+                << escape_csv(p.description) << ","
+                << escape_csv(double_to_string(p.price)) << ","
+                << escape_csv(int_to_string(p.stock)) << "\n";
+        }
+        out.close();
+    }
+
+    void create_sample() {
+        products.clear();
+        add_product("Coffee Mug", "Ceramic mug 350ml", 7.99, 100);
+        add_product("T-Shirt", "100% cotton, size M", 14.99, 50);
+        add_product("Wireless Mouse", "Ergonomic Bluetooth mouse", 29.99, 25);
+        add_product("Notebook", "A5 lined notebook", 4.50, 200);
+        add_product("Water Bottle", "1L stainless steel", 19.95, 60);
+        save();
+        cout << "Created sample inventory in " << filename << endl;
+    }
+
+    vector<Product> list_all() const {
+        vector<Product> out;
+        for (map<int, Product>::const_iterator it = products.begin(); it != products.end(); ++it) {
+            out.push_back(it->second);
+        }
+        // already ordered by id because map is ordered
+        return out;
+    }
+
+    bool get_product_by_id(int id, Product &outp) const {
+        map<int, Product>::const_iterator it = products.find(id);
+        if (it == products.end()) return false;
+        outp = it->second;
+        return true;
+    }
+
+    vector<Product> search_by_name(const string &q) const {
+        vector<Product> out;
+        string lowq = q;
+        for (size_t i = 0; i < lowq.size(); ++i) lowq[i] = char(tolower(lowq[i]));
+        for (map<int, Product>::const_iterator it = products.begin(); it != products.end(); ++it) {
+            string name = it->second.name;
+            string lname = name;
+            for (size_t i = 0; i < lname.size(); ++i) lname[i] = char(tolower(lname[i]));
+            if (lname.find(lowq) != string::npos) out.push_back(it->second);
+        }
+        return out;
+    }
+
+    int add_product(const string &name, const string &desc, double price, int stock) {
+        int id = nextId++;
+        products[id] = Product(id, name, desc, price, stock);
+        save();
+        return id;
+    }
+
+    bool update_stock(int productId, int delta) {
+        map<int, Product>::iterator it = products.find(productId);
+        if (it == products.end()) return false;
+        if (delta < 0 && it->second.stock + delta < 0) return false;
+        it->second.stock += delta;
+        save();
+        return true;
+    }
+
+    bool set_stock(int productId, int newStock) {
+        map<int, Product>::iterator it = products.find(productId);
+        if (it == products.end()) return false;
+        it->second.stock = newStock;
+        save();
+        return true;
+    }
+};
+
+// -----------------------------
+// Cart
+// -----------------------------
+class Cart {
+private:
+    vector<CartItem> items;
+    int find_index_by_pid(int pid) const {
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (items[i].productId == pid) return int(i);
+        }
+        return -1;
+    }
+public:
+    void add_item(const Product &p, int qty) {
+        if (qty <= 0) return;
+        int idx = find_index_by_pid(p.id);
+        if (idx >= 0) items[idx].qty += qty;
+        else items.push_back(CartItem(p.id, p.name, p.price, qty));
+    }
+    bool remove_item(int productId) {
+        int idx = find_index_by_pid(productId);
+        if (idx < 0) return false;
+        items.erase(items.begin() + idx);
+        return true;
+    }
+    bool update_qty(int productId, int newQty) {
+        if (newQty < 0) return false;
+        int idx = find_index_by_pid(productId);
+        if (idx < 0) return false;
+        if (newQty == 0) items.erase(items.begin() + idx);
+        else items[idx].qty = newQty;
+        return true;
+    }
+    vector<CartItem> get_items() const { return items; }
+    void clear() { items.clear(); }
+    bool empty() const { return items.empty(); }
+    double subtotal() const {
+        double s = 0.0;
+        for (size_t i = 0; i < items.size(); ++i) s += items[i].unitPrice * items[i].qty;
+        return s;
+    }
+};
+
+// -----------------------------
+// Order manager (simple CSV)
+ // -----------------------------
+struct Order {
+    int orderId;
+    string timestamp;
+    vector<CartItem> items;
+    double subtotal;
+    double tax;
+    double discount;
+    double total;
+};
+
+class OrderManager {
+private:
+    string filename;
+    int nextOrderId;
+public:
+    OrderManager(const string &file = "orders.csv") : filename(file), nextOrderId(1) {
+        ifstream in(filename.c_str());
+        string line;
+        while (getline(in, line)) {
+            if (trim(line).empty()) continue;
+            ++nextOrderId;
+        }
+        in.close();
+    }
+    void save_order(const Order &o) {
+        ofstream out(filename.c_str(), ios::app);
+        if (!out) {
+            cerr << "Failed to write orders file\n";
+            return;
+        }
+        // items serialized as pid|name|unit|qty;...
+        string items_serialized;
+        for (size_t i = 0; i < o.items.size(); ++i) {
+            if (i) items_serialized += ";";
+            const CartItem &it = o.items[i];
+            items_serialized += int_to_string(it.productId) + "|" + escape_csv(it.name) + "|" + double_to_string(it.unitPrice) + "|" + int_to_string(it.qty);
+        }
+        out << escape_csv(int_to_string(o.orderId)) << ","
+            << escape_csv(o.timestamp) << ","
+            << escape_csv(double_to_string(o.subtotal)) << ","
+            << escape_csv(double_to_string(o.tax)) << ","
+            << escape_csv(double_to_string(o.discount)) << ","
+            << escape_csv(double_to_string(o.total)) << ","
+            << escape_csv(items_serialized) << "\n";
+        out.close();
+    }
+    int next_id() { return nextOrderId++; }
+};
+
+// -----------------------------
+// Business rules & utilities
+// -----------------------------
+const double TAX_RATE = 0.07;
+
+double compute_discount(const Cart &cart) {
+    double s = cart.subtotal();
+    if (s >= 200.0) return s * 0.10;
+    if (s >= 50.0) return 5.0;
+    return 0.0;
+}
+
+string current_timestamp() {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", t);
+    return string(buf);
+}
+
+// -----------------------------
+// UI helpers
+// -----------------------------
+void print_header() {
+    cout << "=========================================\n";
+    cout << "      Simple Online Shopping System      \n";
+    cout << "=========================================\n";
+}
+
+void print_product_row(const Product &p) {
+    cout << setw(5) << p.id
+         << setw(25) << (p.name.size() > 24 ? p.name.substr(0,21) + "..." : p.name)
+         << setw(10) << fixed << setprecision(2) << p.price
+         << setw(8) << p.stock << "\n";
+}
+
+void list_products(const Inventory &inv) {
+    vector<Product> list = inv.list_all();
+    if (list.empty()) {
+        cout << "No products available.\n";
+        return;
+    }
+    cout << left << setw(5) << "ID" << setw(25) << "Name" << setw(10) << "Price" << setw(8) << "Stock" << "\n";
+    cout << "---------------------------------------------------------\n";
+    for (size_t i = 0; i < list.size(); ++i) print_product_row(list[i]);
+}
+
+void show_product_details(const Inventory &inv, int id) {
+    Product p;
+    if (!inv.get_product_by_id(id, p)) {
+        cout << "Product not found.\n";
+        return;
+    }
+    cout << "ID: " << p.id << "\n";
+    cout << "Name: " << p.name << "\n";
+    cout << "Description: " << p.description << "\n";
+    cout << "Price: $" << fixed << setprecision(2) << p.price << "\n";
+    cout << "Stock: " << p.stock << "\n";
+}
+
+void show_cart(const Cart &cart) {
+    vector<CartItem> items = cart.get_items();
+    if (items.empty()) {
+        cout << "Cart is empty.\n";
+        return;
+    }
+    cout << left << setw(5) << "PID" << setw(25) << "Name" << setw(10) << "Unit" << setw(6) << "Qty" << setw(12) << "Total" << "\n";
+    cout << "------------------------------------------------------------------\n";
+    for (size_t i = 0; i < items.size(); ++i) {
+        const CartItem &it = items[i];
+        cout << left << setw(5) << it.productId
+             << setw(25) << (it.name.size() > 24 ? it.name.substr(0,21) + "..." : it.name)
+             << setw(10) << fixed << setprecision(2) << it.unitPrice
+             << setw(6) << it.qty
+             << setw(12) << fixed << setprecision(2) << (it.unitPrice * it.qty) << "\n";
+    }
+    double sub = cart.subtotal();
+    double discount = compute_discount(cart);
+    double tax = (sub - discount) * TAX_RATE;
+    double total = sub - discount + tax;
+    cout << "------------------------------------------------------------------\n";
+    cout << "Subtotal: $" << fixed << setprecision(2) << sub << "\n";
+    cout << "Discount: -$" << fixed << setprecision(2) << discount << "\n";
+    cout << "Tax (" << (TAX_RATE*100) << "%): $" << fixed << setprecision(2) << tax << "\n";
+    cout << "TOTAL: $" << fixed << setprecision(2) << total << "\n";
+}
+
+// -----------------------------
+// Checkout and admin
+// -----------------------------
+bool checkout(Cart &cart, Inventory &inv, OrderManager &om) {
+    if (cart.empty()) {
+        cout << "Cart is empty. Nothing to checkout.\n";
+        return false;
+    }
+    vector<CartItem> items = cart.get_items();
+    for (size_t i = 0; i < items.size(); ++i) {
+        Product p;
+        if (!inv.get_product_by_id(items[i].productId, p)) {
+            cout << "Product ID " << items[i].productId << " no longer exists. Remove it from cart.\n";
+            return false;
+        }
+        if (p.stock < items[i].qty) {
+            cout << "Insufficient stock for product '" << p.name << "'. Available: " << p.stock << ", requested: " << items[i].qty << "\n";
+            return false;
+        }
+    }
+    double sub = cart.subtotal();
+    double discount = compute_discount(cart);
+    double tax = (sub - discount) * TAX_RATE;
+    double total = sub - discount + tax;
+
+    cout << "\nCHECKOUT SUMMARY\n";
+    show_cart(cart);
+    cout << "Proceed to place the order? (y/n): ";
+    char c; cin >> c;
+    cin.ignore(numeric_limits<streamsize>::max(), '\n');
+    if (c != 'y' && c != 'Y') {
+        cout << "Checkout cancelled.\n";
+        return false;
+    }
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (!inv.update_stock(items[i].productId, -items[i].qty)) {
+            cerr << "ERROR updating stock for product " << items[i].productId << "\n";
+        }
+    }
+
+    Order o;
+    o.orderId = om.next_id();
+    o.timestamp = current_timestamp();
+    o.items = items;
+    o.subtotal = sub;
+    o.discount = discount;
+    o.tax = tax;
+    o.total = total;
+    om.save_order(o);
+
+    cout << "\nOrder placed successfully! Order ID: " << o.orderId << "\n";
+    cout << "Order timestamp: " << o.timestamp << "\n";
+    cout << "Amount charged: $" << fixed << setprecision(2) << o.total << "\n";
+    cart.clear();
+    return true;
+}
+
+void admin_menu(Inventory &inv) {
+    while (1) {
+        cout << "\n--- Admin Menu ---\n";
+        cout << "1) List products\n2) Add product\n3) Update stock\n4) Back\nChoose: ";
+        int choice;
+        if (!(cin >> choice)) { cin.clear(); cin.ignore(numeric_limits<streamsize>::max(), '\n'); continue; }
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        if (choice == 1) {
+            list_products(inv);
+        } else if (choice == 2) {
+            string name, desc;
+            double price;
+            int stock;
+            cout << "Name: "; getline(cin, name);
+            cout << "Description: "; getline(cin, desc);
+            cout << "Price: "; cin >> price;
+            cout << "Stock: "; cin >> stock;
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            int id = inv.add_product(name, desc, price, stock);
+            cout << "Added product with id " << id << "\n";
+        } else if (choice == 3) {
+            int pid; int newStock;
+            cout << "Product ID: "; cin >> pid;
+            cout << "New stock: "; cin >> newStock;
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            if (inv.set_stock(pid, newStock)) cout << "Stock updated.\n";
+            else cout << "Failed to update stock (invalid product id).\n";
+        } else if (choice == 4) {
+            break;
+        } else {
+            cout << "Invalid\n";
+        }
+    }
+}
+
+// -----------------------------
+// Main
+// -----------------------------
+int main() {
+    Inventory inventory("products.csv");
+    Cart cart;
+    OrderManager om("orders.csv");
+
+    print_header();
+    while (1) {
+        cout << "\nMain Menu:\n";
+        cout << "1) Browse products\n2) Search products\n3) View product details\n4) Add product to cart\n5) View cart\n6) Update cart\n7) Checkout\n8) Admin menu\n9) Quit\n";
+        cout << "Choose an option: ";
+        int opt;
+        if (!(cin >> opt)) {
+            cin.clear();
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            cout << "Invalid input, try again.\n";
+            continue;
+        }
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+
+        if (opt == 1) {
+            list_products(inventory);
+        } else if (opt == 2) {
+            string q;
+            cout << "Enter search query: ";
+            getline(cin, q);
+            vector<Product> results = inventory.search_by_name(q);
+            if (results.empty()) cout << "No results.\n";
+            else {
+                cout << "Search results:\n";
+                cout << left << setw(5) << "ID" << setw(25) << "Name" << setw(10) << "Price" << setw(8) << "Stock" << "\n";
+                for (size_t i = 0; i < results.size(); ++i) print_product_row(results[i]);
+            }
+        } else if (opt == 3) {
+            int id; cout << "Enter product ID: "; cin >> id; cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            show_product_details(inventory, id);
+        } else if (opt == 4) {
+            int id, qty;
+            cout << "Product ID: "; cin >> id;
+            cout << "Quantity: "; cin >> qty;
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            Product p;
+            if (!inventory.get_product_by_id(id, p)) { cout << "Product not found.\n"; continue; }
+            if (qty <= 0) { cout << "Invalid quantity.\n"; continue; }
+            if (p.stock < qty) { cout << "Not enough stock. Available: " << p.stock << "\n"; continue; }
+            cart.add_item(p, qty);
+            cout << "Added to cart: " << p.name << " x" << qty << "\n";
+        } else if (opt == 5) {
+            show_cart(cart);
+        } else if (opt == 6) {
+            if (cart.empty()) { cout << "Cart empty.\n"; continue; }
+            cout << "Cart management:\n1) Remove item\n2) Update quantity\n3) Clear cart\nChoose: ";
+            int a; cin >> a; cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            if (a == 1) {
+                int pid; cout << "Product ID to remove: "; cin >> pid; cin.ignore(numeric_limits<streamsize>::max(), '\n');
+                if (cart.remove_item(pid)) cout << "Removed.\n"; else cout << "Item not in cart.\n";
+            } else if (a == 2) {
+                int pid, nq; cout << "Product ID: "; cin >> pid; cout << "New quantity: "; cin >> nq; cin.ignore(numeric_limits<streamsize>::max(), '\n');
+                if (nq < 0) { cout << "Invalid qty.\n"; continue; }
+                Product prod;
+                if (!inventory.get_product_by_id(pid, prod)) { cout << "Product doesn't exist.\n"; continue; }
+                if (prod.stock < nq) { cout << "Not enough stock.\n"; continue; }
+                if (cart.update_qty(pid, nq)) cout << "Quantity updated.\n"; else cout << "Item not in cart.\n";
+            } else if (a == 3) {
+                cart.clear(); cout << "Cart cleared.\n";
+            } else cout << "Invalid.\n";
+        } else if (opt == 7) {
+            checkout(cart, inventory, om);
+        } else if (opt == 8) {
+            cout << "Enter admin password: ";
+            string pw;
+            getline(cin, pw);
+            if (pw == "admin123") admin_menu(inventory);
+            else cout << "Incorrect password.\n";
+        } else if (opt == 9) {
+            cout << "Goodbye!\n";
+            break;
+        } else {
+            cout << "Invalid option\n";
+        }
+    }
+
+    return 0;
+}
